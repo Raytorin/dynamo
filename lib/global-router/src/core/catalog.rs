@@ -8,7 +8,8 @@
 //! all pools share the routing group [`ROUTING_GROUP`], so the pools of a
 //! model form one partition. The worker id is a hash of the pool id, which
 //! both sides can compute, so a chosen worker maps back to its pool without
-//! a table.
+//! a table. Pickers that weigh pool signals get the way back through a
+//! [`PoolDirectory`] the source keeps in step with its snapshots.
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use dynamo_kv_router::services::selection::{WorkerCatalogSource, WorkerRequest};
 use tokio::sync::watch;
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::directory::PoolDirectory;
 use crate::Pool;
 use crate::selector::reachable;
 
@@ -63,6 +65,7 @@ pub fn workers(pools: &[Pool]) -> Vec<WorkerRequest> {
 /// its last frontend is added or removed on the next snapshot.
 pub struct PoolCatalogSource<S> {
     pools: watch::Receiver<Arc<S>>,
+    directory: Option<Arc<PoolDirectory>>,
     started: bool,
 }
 
@@ -71,8 +74,16 @@ impl<S> PoolCatalogSource<S> {
     pub fn new(pools: watch::Receiver<Arc<S>>) -> Self {
         Self {
             pools,
+            directory: None,
             started: false,
         }
+    }
+
+    /// Also keeps `directory` in step with the snapshots, for pickers that
+    /// map workers back to pools.
+    pub fn with_directory(mut self, directory: Arc<PoolDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
     }
 }
 
@@ -82,13 +93,18 @@ where
     S: AsRef<[Pool]> + Send + Sync,
 {
     /// The current pools first, then each change; `None` once the catalog
-    /// is dropped.
+    /// is dropped. The directory is updated before the core sees the
+    /// snapshot, so a picker never meets a worker the directory lacks.
     async fn next_snapshot(&mut self) -> Option<Vec<WorkerRequest>> {
         if std::mem::replace(&mut self.started, true) {
             self.pools.changed().await.ok()?;
         }
         let snapshot = self.pools.borrow_and_update().clone();
-        Some(workers((*snapshot).as_ref()))
+        let pools: &[Pool] = (*snapshot).as_ref();
+        if let Some(directory) = &self.directory {
+            directory.replace(pools);
+        }
+        Some(workers(pools))
     }
 }
 
@@ -143,11 +159,16 @@ mod tests {
         let blue = pool("blue", "qwen", &["http://blue:8000"]);
         let green = pool("green", "qwen", &["http://green:8000"]);
         let (catalog, pools) = watch::channel(Arc::new(vec![blue.clone()]));
-        let mut source = PoolCatalogSource::new(pools);
+        let directory = Arc::new(PoolDirectory::new());
+        let mut source = PoolCatalogSource::new(pools).with_directory(directory.clone());
 
         // The first snapshot comes without waiting for a change.
         let first = source.next_snapshot().await.unwrap();
         assert_eq!(ids(&first), [worker_id(&blue.id)]);
+        assert_eq!(
+            directory.pool(worker_id(&blue.id)).map(|entry| entry.id),
+            Some(blue.id.clone())
+        );
 
         catalog.send_replace(Arc::new(vec![blue.clone(), green.clone()]));
         let mut second = ids(&source.next_snapshot().await.unwrap());
@@ -155,6 +176,7 @@ mod tests {
         let mut both = [worker_id(&blue.id), worker_id(&green.id)];
         both.sort_unstable();
         assert_eq!(second, both);
+        assert_eq!(directory.snapshot().len(), 2);
 
         // Losing its last frontend removes a pool.
         let mut blue_down = blue.clone();
